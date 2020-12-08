@@ -9,21 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"io/ioutil"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/retry"
-	"k8s.io/klog"
-	"kubesphere.io/tower/pkg/agent"
-	"kubesphere.io/tower/pkg/apis/cluster/v1alpha1"
-	"kubesphere.io/tower/pkg/certs"
-	clientset "kubesphere.io/tower/pkg/client/clientset/versioned"
-	clusterinformers "kubesphere.io/tower/pkg/client/informers/externalversions/cluster/v1alpha1"
-	"kubesphere.io/tower/pkg/utils"
-	"kubesphere.io/tower/pkg/version"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -31,6 +17,22 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/gorilla/websocket"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/klog"
+
+	"kubesphere.io/tower/pkg/agent"
+	"kubesphere.io/tower/pkg/apis/cluster/v1alpha1"
+	"kubesphere.io/tower/pkg/certs"
+	clientset "kubesphere.io/tower/pkg/client/clientset/versioned"
+	clusterinformers "kubesphere.io/tower/pkg/client/informers/externalversions/cluster/v1alpha1"
+	"kubesphere.io/tower/pkg/utils"
+	"kubesphere.io/tower/pkg/version"
 )
 
 var upgrader = websocket.Upgrader{
@@ -172,11 +174,6 @@ func (s *Proxy) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if _, ok := s.sessions[c.Name]; ok {
-		r.Reply(false, []byte("A session already allocated for this client."))
-		return
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -193,13 +190,44 @@ func (s *Proxy) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	proxy, _ := NewHTTPProxy(func() ssh.Conn { return sshConn }, client.Spec.Connection.KubernetesAPIServerPort, client.Spec.Connection.KubeSphereAPIServerPort, c, s.caCert, cert, key)
-	if err := proxy.Start(ctx); err != nil {
-		failed(err)
-		return
-	}
+	var (
+		proxy        *HTTPProxy
+		k8sTransport *http.Transport
+		ksTransport  *http.Transport
+	)
 
-	s.sessions[c.Name] = proxy
+	// if an agent has connected the server with the same cluster name, we don't need to create HttpProxy anymore
+	// we only create two new httpTransport object, then put them into the server's httpClient set.
+	if proxy, ok = s.sessions[c.Name]; !ok {
+		proxy, err = NewHTTPProxy(func() ssh.Conn { return sshConn }, client.Spec.Connection.KubernetesAPIServerPort, client.Spec.Connection.KubeSphereAPIServerPort, c, s.caCert, cert, key)
+		if err != nil {
+			failed(err)
+			return
+		}
+
+		if err = proxy.Start(ctx); err != nil {
+			failed(err)
+			return
+		}
+
+		s.sessions[c.Name] = proxy
+	} else {
+		k8sTransport, _, _, err = buildServerData(func() ssh.Conn { return sshConn }, c.KubernetesSvcHost, c.CAData, c.CertData, c.KeyData, s.caCert, cert, key)
+		if err != nil {
+			failed(err)
+			return
+		}
+
+		ksTransport, _, _, err = buildServerData(func() ssh.Conn { return sshConn }, c.KubeSphereSvcHost, c.CAData, c.CertData, c.KeyData, s.caCert, cert, key)
+
+		proxy.kubernetesAPIServerProxy.rwLock.Lock()
+		proxy.kubernetesAPIServerProxy.httpClient = append(proxy.kubernetesAPIServerProxy.httpClient, &http.Client{Transport: k8sTransport})
+		proxy.kubernetesAPIServerProxy.rwLock.Unlock()
+
+		proxy.kubesphereAPIServerProxy.rwLock.Lock()
+		proxy.kubesphereAPIServerProxy.httpClient = append(proxy.kubesphereAPIServerProxy.httpClient, &http.Client{Transport: ksTransport})
+		proxy.kubesphereAPIServerProxy.rwLock.Unlock()
+	}
 
 	r.Reply(true, nil)
 	klog.V(0).Infof("Connection established with %s", client.Name)
@@ -211,10 +239,41 @@ func (s *Proxy) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	go s.handleSSHChannels(chans)
 	sshConn.Wait()
 	klog.V(0).Infof("Connection closed with %s", client.Name)
-	delete(s.sessions, c.Name)
-	retry.OnError(retry.DefaultBackoff, apierrors.IsConflict, func() error {
-		return s.Update(client, false)
-	})
+
+	proxy.kubernetesAPIServerProxy.rwLock.Lock()
+	defer proxy.kubernetesAPIServerProxy.rwLock.Unlock()
+	k8sLen := len(proxy.kubernetesAPIServerProxy.httpClient)
+
+	proxy.kubesphereAPIServerProxy.rwLock.Lock()
+	defer proxy.kubesphereAPIServerProxy.rwLock.Unlock()
+	ksLen := len(proxy.kubesphereAPIServerProxy.httpClient)
+
+	// httpClientLength <= 1 means there is not enough agent connection
+	// we need to delete the key, update cluster status
+	// httpClientLength > 1 means there are enough agent connections
+	// we just update the httpTransport set safely
+	if k8sLen <= 1 || ksLen <= 1 {
+		delete(s.sessions, c.Name)
+		retry.OnError(retry.DefaultBackoff, apierrors.IsConflict, func() error {
+			return s.Update(client, false)
+		})
+	} else {
+		for i, v := range proxy.kubernetesAPIServerProxy.httpClient {
+			if v.Transport == k8sTransport {
+				proxy.kubernetesAPIServerProxy.httpClient = append(proxy.kubernetesAPIServerProxy.httpClient[:i],
+					proxy.kubernetesAPIServerProxy.httpClient[i+1:]...)
+				break
+			}
+		}
+
+		for i, v := range proxy.kubesphereAPIServerProxy.httpClient {
+			if v.Transport == ksTransport {
+				proxy.kubesphereAPIServerProxy.httpClient = append(proxy.kubesphereAPIServerProxy.httpClient[:i],
+					proxy.kubesphereAPIServerProxy.httpClient[i+1:]...)
+				break
+			}
+		}
+	}
 }
 
 func (s *Proxy) Run(stopCh <-chan struct{}) error {

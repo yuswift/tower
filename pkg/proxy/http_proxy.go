@@ -17,13 +17,22 @@ type HTTPProxy struct {
 }
 
 func NewHTTPProxy(ssh utils.GetSSHConn, kubernetesPort uint16, kubespherePort uint16, config *agent.Config, ca, serverCert, serverKey []byte) (*HTTPProxy, error) {
-
-	kubernetesAPIServerProxy, err := newProxyServer(ssh, fmt.Sprintf("%s-kubernetes", config.Name), config.KubernetesSvcHost, "https", kubernetesPort, config.CAData, config.CertData, config.KeyData, config.BearerToken, ca, serverCert, serverKey)
+	transPort, useBearerToken, servertlsConfig, err := buildServerData(ssh, config.KubernetesSvcHost, config.CAData, config.CertData, config.KeyData, ca, serverCert, serverKey)
 	if err != nil {
 		return nil, err
 	}
 
-	kubesphereAPIServerProxy, err := newProxyServer(ssh, fmt.Sprintf("%s-kubesphere", config.Name), config.KubeSphereSvcHost, "http", kubespherePort, nil, nil, nil, nil, nil, nil, nil)
+	kubernetesAPIServerProxy, err := newProxyServer(fmt.Sprintf("%s-kubernetes", config.Name), config.KubernetesSvcHost, "https", kubernetesPort, useBearerToken, transPort, servertlsConfig, config.BearerToken)
+	if err != nil {
+		return nil, err
+	}
+
+	transPort, useBearerToken, _, err = buildServerData(ssh, config.KubeSphereSvcHost, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	kubesphereAPIServerProxy, err := newProxyServer(fmt.Sprintf("%s-kubesphere", config.Name), config.KubeSphereSvcHost, "http", kubespherePort, useBearerToken, transPort, nil, nil)
 	if err != nil {
 		return nil, err
 	}
